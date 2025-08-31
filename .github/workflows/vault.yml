@@ -1,0 +1,64 @@
+name: Vault to Immutable S3 (no external actions)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ '*' ]
+  workflow_dispatch: {}
+
+env:
+  BUCKET: ${{ secrets.BUCKET }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  RETENTION_DAYS: ${{ vars.RETENTION_DAYS }}
+
+jobs:
+  vault:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install AWS CLI v2
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install awscli
+          aws --version
+
+      - name: Make repo archive of current commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifact
+          TS=$(date -u +'%Y-%m-%dT%H-%M-%SZ')
+          echo "TS=$TS" >> "$GITHUB_ENV"
+          curl -fL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_SHA}" \
+            -o "artifact/repo_${TS}.tar.gz"
+          echo "ARCHIVE=artifact/repo_${TS}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Sanity (identity & optional bucket checks)
+        run: |
+          aws sts get-caller-identity
+          echo "Region: ${AWS_REGION}"
+          echo "Bucket: ${BUCKET}"
+          aws s3api get-bucket-versioning --bucket "${BUCKET}" || echo "(versioning check skipped)"
+          aws s3api get-object-lock-configuration --bucket "${BUCKET}" || echo "(object lock check skipped)"
+
+      - name: Compute retain-until (UTC)
+        run: |
+          DAYS="${RETENTION_DAYS:-90}"
+          RETAIN_UNTIL=$(date -u -d "+${DAYS} days" +'%Y-%m-%dT%H:%M:%SZ')
+          echo "RETAIN_UNTIL=${RETAIN_UNTIL}" >> "$GITHUB_ENV"
+
+      - name: Upload immutable object
+        run: |
+          KEY="github/${GITHUB_REPOSITORY}/${TS}/$(basename "${ARCHIVE}")"
+          echo "Uploading to s3://${BUCKET}/${KEY}"
+          aws s3api put-object \
+            --bucket "${BUCKET}" \
+            --key "${KEY}" \
+            --body "${ARCHIVE}" \
+            --object-lock-mode COMPLIANCE \
+            --object-lock-retain-until-date "${RETAIN_UNTIL}"
+          echo "Uploaded: s3://${BUCKET}/${KEY}"
